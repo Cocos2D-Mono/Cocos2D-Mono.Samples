@@ -26,6 +26,66 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+
+      # Samples references core as a nuget package, and the release train bumps
+      # that reference to the new version at stage. The package does not exist
+      # on nuget.org until core ships - and core cannot ship while this check is
+      # red. Packing core from source at the matching ref, into a feed the
+      # restore sees first, breaks that cycle. It also means a green check here
+      # reflects the actual release commit, not whatever was last pushed to
+      # nuget.org by hand.
+      - name: Resolve the matching Cocos2D-Mono ref
+        id: core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # On a release branch, build against core's branch of the same name -
+          # stage cuts both from dev in the same run, core first. Anywhere else,
+          # dev. pull_request events carry the branch in head_ref.
+          want="${{ github.head_ref || github.ref_name }}"
+          ref=dev
+          case "$want" in
+            release/*)
+              if gh api "repos/Cocos2D-Mono/Cocos2D-Mono/git/ref/heads/$want" >/dev/null 2>&1; then
+                ref="$want"
+              fi ;;
+          esac
+          # Pack as whatever version this repo asks for, so the reference resolves
+          # regardless of what core's own props say at that commit.
+          ver=$(grep -oE '<Cocos2DMonoVersion>[^<]+' Directory.Build.props | cut -d'>' -f2)
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Cocos2D-Mono @ $ref, packed as $ver"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Cocos2D-Mono/Cocos2D-Mono
+          ref: ${{ steps.core.outputs.ref }}
+          path: core
+
+      - name: Pack Cocos2D-Mono from source into a local feed
+        shell: bash
+        run: |
+          # Same three packs as core's own pack.yml, in the same order: the Core
+          # metapackage pins Cocos2D-Mono at [$(Version)], so it has to restore
+          # against the feed the other two were just packed into.
+          #
+          # net10.0 only. Every sample this job builds is net10.0, and narrowing
+          # the TFM list is the supported path in core's Directory.Build.props -
+          # it is what saves installing the android and ios workloads.
+          feed="${{ github.workspace }}/localfeed"
+          v="${{ steps.core.outputs.version }}"
+          narrow="-p:Cocos2DTargetFrameworks=net10.0"
+          dotnet restore core/src/Box2D/Box2D.csproj $narrow
+          dotnet restore core/src/Cocos2DMono/Cocos2DMono.csproj $narrow
+          dotnet pack core/src/Box2D/Box2D.csproj -c Release --no-restore -o "$feed" -p:Version=$v $narrow
+          dotnet pack core/src/Cocos2DMono/Cocos2DMono.csproj -c Release --no-restore -o "$feed" -p:Version=$v $narrow
+          dotnet nuget add source "$feed" --name local-core
+          dotnet restore core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -p:Version=$v $narrow
+          dotnet pack core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -c Release --no-restore --no-build -o "$feed" -p:Version=$v $narrow
+          ls "$feed"
+
       - name: Build every plain net10.0 sample
         shell: bash
         run: |
@@ -44,6 +104,8 @@ jobs:
             tfm=$(grep -oE '<TargetFramework>[^<]*' "$proj" | head -1 | cut -d'>' -f2)
             [ "$tfm" = "net10.0" ] || continue
             case "$proj" in
+              core/*)
+                continue ;;   # the core checkout is an input, not a sample
               *"Tutorial Samples/Platformer/Checkpoints"*)
                 echo "SKIPPED (known broken, see comment): $proj"
                 skipped=$((skipped+1)); continue ;;
