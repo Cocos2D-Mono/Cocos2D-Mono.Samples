@@ -39,16 +39,19 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # Through env rather than interpolated into the script: on a fork PR
+          # the branch name is contributor-controlled, and ${{ }} substitution
+          # happens before bash sees the text.
+          REQUESTED_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           # On a release branch, build against core's branch of the same name -
           # stage cuts both from dev in the same run, core first. Anywhere else,
-          # dev. pull_request events carry the branch in head_ref.
-          want="${{ github.head_ref || github.ref_name }}"
+          # dev.
           ref=dev
-          case "$want" in
+          case "$REQUESTED_REF" in
             release/*)
-              if gh api "repos/Cocos2D-Mono/Cocos2D-Mono/git/ref/heads/$want" >/dev/null 2>&1; then
-                ref="$want"
+              if gh api "repos/Cocos2D-Mono/Cocos2D-Mono/git/ref/heads/$REQUESTED_REF" >/dev/null 2>&1; then
+                ref="$REQUESTED_REF"
               fi ;;
           esac
           # Pack as whatever version this repo asks for, so the reference resolves
@@ -64,27 +67,62 @@ jobs:
           ref: ${{ steps.core.outputs.ref }}
           path: core
 
-      - name: Pack Cocos2D-Mono from source into a local feed
+      - name: Make the local feed authoritative for core packages
         shell: bash
+        env:
+          FEED: ${{ github.workspace }}/localfeed
+        run: |
+          # Adding a source does not make it win. With the same version on both
+          # nuget.org and the local feed, restore could take either - so "builds
+          # against the actual release commit" would only be incidentally true.
+          # Source mapping makes it true by construction: every Cocos2D-Mono* id
+          # resolves from the local feed and nothing else can, while everything
+          # else still comes from nuget.org. Neither this repo nor core ships a
+          # nuget.config, so this one at the workspace root governs both.
+          mkdir -p "$FEED"
+          cat > nuget.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local-core" value="$FEED" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local-core">
+                <package pattern="Cocos2D-Mono" />
+                <package pattern="Cocos2D-Mono.*" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+          cat nuget.config
+
+      - name: Pack Cocos2D-Mono from source into the local feed
+        shell: bash
+        env:
+          FEED: ${{ github.workspace }}/localfeed
+          CORE_VERSION: ${{ steps.core.outputs.version }}
         run: |
           # Same three packs as core's own pack.yml, in the same order: the Core
-          # metapackage pins Cocos2D-Mono at [$(Version)], so it has to restore
-          # against the feed the other two were just packed into.
+          # metapackage pins Cocos2D-Mono at [$(Version)], so it restores against
+          # the feed the other two were just packed into - which the source
+          # mapping above now guarantees.
           #
           # net10.0 only. Every sample this job builds is net10.0, and narrowing
           # the TFM list is the supported path in core's Directory.Build.props -
           # it is what saves installing the android and ios workloads.
-          feed="${{ github.workspace }}/localfeed"
-          v="${{ steps.core.outputs.version }}"
           narrow="-p:Cocos2DTargetFrameworks=net10.0"
           dotnet restore core/src/Box2D/Box2D.csproj $narrow
           dotnet restore core/src/Cocos2DMono/Cocos2DMono.csproj $narrow
-          dotnet pack core/src/Box2D/Box2D.csproj -c Release --no-restore -o "$feed" -p:Version=$v $narrow
-          dotnet pack core/src/Cocos2DMono/Cocos2DMono.csproj -c Release --no-restore -o "$feed" -p:Version=$v $narrow
-          dotnet nuget add source "$feed" --name local-core
-          dotnet restore core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -p:Version=$v $narrow
-          dotnet pack core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -c Release --no-restore --no-build -o "$feed" -p:Version=$v $narrow
-          ls "$feed"
+          dotnet pack core/src/Box2D/Box2D.csproj -c Release --no-restore -o "$FEED" -p:Version="$CORE_VERSION" $narrow
+          dotnet pack core/src/Cocos2DMono/Cocos2DMono.csproj -c Release --no-restore -o "$FEED" -p:Version="$CORE_VERSION" $narrow
+          dotnet restore core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -p:Version="$CORE_VERSION" $narrow
+          dotnet pack core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -c Release --no-restore --no-build -o "$FEED" -p:Version="$CORE_VERSION" $narrow
+          ls "$FEED"
 
       - name: Build every plain net10.0 sample
         shell: bash
