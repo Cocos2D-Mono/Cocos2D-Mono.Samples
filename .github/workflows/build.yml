@@ -101,11 +101,14 @@ jobs:
           shopt -s globstar nullglob
           fail=0; built=0; skipped=0
           for proj in **/*.csproj; do
+            # The core checkout is an input, not a sample - and it has to be
+            # skipped before the grep below: core's csproj files use
+            # <TargetFrameworks> (plural), so grep finds nothing and exits 1,
+            # and under the runner's bash -e that ends the whole script.
+            case "$proj" in core/*) continue ;; esac
             tfm=$(grep -oE '<TargetFramework>[^<]*' "$proj" | head -1 | cut -d'>' -f2)
             [ "$tfm" = "net10.0" ] || continue
             case "$proj" in
-              core/*)
-                continue ;;   # the core checkout is an input, not a sample
               *"Tutorial Samples/Platformer/Checkpoints"*)
                 echo "SKIPPED (known broken, see comment): $proj"
                 skipped=$((skipped+1)); continue ;;
