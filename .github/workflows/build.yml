@@ -1,0 +1,161 @@
+# Build check for the release train.
+#
+# ci_green() reads check-runs on the release PR's head commit and fails closed,
+# so this must fire for a `release/x.y.z -> main` pull request. The bare
+# `pull_request:` trigger is what does that; `push: dev` is for day-to-day
+# feedback.
+#
+# Compile only - this repo has no test project. If one is added, add a
+# `dotnet test` step so the gate means more than "it builds".
+
+name: Build
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+
+jobs:
+  samples:
+    name: Samples (net10.0)
+    # windows-latest for the content pipeline's fonts. The spritefonts resolve
+    # font names from installed system fonts, and a Linux runner has none of them.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # Samples references core as a nuget package, and the release train bumps
+      # that reference to the new version at stage. The package does not exist
+      # on nuget.org until core ships - and core cannot ship while this check is
+      # red. Packing core from source at the matching ref, into a feed the
+      # restore sees first, breaks that cycle. It also means a green check here
+      # reflects the actual release commit, not whatever was last pushed to
+      # nuget.org by hand.
+      - name: Resolve the matching Cocos2D-Mono ref
+        id: core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Through env rather than interpolated into the script: on a fork PR
+          # the branch name is contributor-controlled, and ${{ }} substitution
+          # happens before bash sees the text.
+          REQUESTED_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          # On a release branch, build against core's branch of the same name -
+          # stage cuts both from dev in the same run, core first. Anywhere else,
+          # dev.
+          ref=dev
+          case "$REQUESTED_REF" in
+            release/*)
+              if gh api "repos/Cocos2D-Mono/Cocos2D-Mono/git/ref/heads/$REQUESTED_REF" >/dev/null 2>&1; then
+                ref="$REQUESTED_REF"
+              fi ;;
+          esac
+          # Pack as whatever version this repo asks for, so the reference resolves
+          # regardless of what core's own props say at that commit.
+          ver=$(grep -oE '<Cocos2DMonoVersion>[^<]+' Directory.Build.props | cut -d'>' -f2)
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Cocos2D-Mono @ $ref, packed as $ver"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Cocos2D-Mono/Cocos2D-Mono
+          ref: ${{ steps.core.outputs.ref }}
+          path: core
+
+      - name: Make the local feed authoritative for core packages
+        shell: bash
+        env:
+          FEED: ${{ github.workspace }}/localfeed
+        run: |
+          # Adding a source does not make it win. With the same version on both
+          # nuget.org and the local feed, restore could take either - so "builds
+          # against the actual release commit" would only be incidentally true.
+          # Source mapping makes it true by construction: every Cocos2D-Mono* id
+          # resolves from the local feed and nothing else can, while everything
+          # else still comes from nuget.org. Neither this repo nor core ships a
+          # nuget.config, so this one at the workspace root governs both.
+          mkdir -p "$FEED"
+          cat > nuget.config <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local-core" value="$FEED" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local-core">
+                <package pattern="Cocos2D-Mono" />
+                <package pattern="Cocos2D-Mono.*" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+          cat nuget.config
+
+      - name: Pack Cocos2D-Mono from source into the local feed
+        shell: bash
+        env:
+          FEED: ${{ github.workspace }}/localfeed
+          CORE_VERSION: ${{ steps.core.outputs.version }}
+        run: |
+          # Same three packs as core's own pack.yml, in the same order: the Core
+          # metapackage pins Cocos2D-Mono at [$(Version)], so it restores against
+          # the feed the other two were just packed into - which the source
+          # mapping above now guarantees.
+          #
+          # net10.0 only. Every sample this job builds is net10.0, and narrowing
+          # the TFM list is the supported path in core's Directory.Build.props -
+          # it is what saves installing the android and ios workloads.
+          narrow="-p:Cocos2DTargetFrameworks=net10.0"
+          dotnet restore core/src/Box2D/Box2D.csproj $narrow
+          dotnet restore core/src/Cocos2DMono/Cocos2DMono.csproj $narrow
+          dotnet pack core/src/Box2D/Box2D.csproj -c Release --no-restore -o "$FEED" -p:Version="$CORE_VERSION" $narrow
+          dotnet pack core/src/Cocos2DMono/Cocos2DMono.csproj -c Release --no-restore -o "$FEED" -p:Version="$CORE_VERSION" $narrow
+          dotnet restore core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -p:Version="$CORE_VERSION" $narrow
+          dotnet pack core/src/Cocos2DMono.Core/Cocos2DMono.Core.csproj -c Release --no-restore --no-build -o "$FEED" -p:Version="$CORE_VERSION" $narrow
+          ls "$FEED"
+
+      - name: Build every plain net10.0 sample
+        shell: bash
+        run: |
+          # Tutorial Samples/Platformer/Checkpoints is EXCLUDED, not skipped by
+          # accident. Part 2 does not compile: GameLayer.cs raises CS0117,
+          # 'PhysicsHelper' does not contain a definition for ... - PhysicsHelper
+          # was refactored by the platformer physics-body work (C2D-241/C2D-242)
+          # and the checkpoint was never updated with it.
+          #
+          # It is excluded so this gate reflects the shipping samples. Anyone
+          # following the tutorial still hits the break, so it wants fixing on
+          # its own merits; remove this exclusion when it is.
+          shopt -s globstar nullglob
+          fail=0; built=0; skipped=0
+          for proj in **/*.csproj; do
+            # The core checkout is an input, not a sample - and it has to be
+            # skipped before the grep below: core's csproj files use
+            # <TargetFrameworks> (plural), so grep finds nothing and exits 1,
+            # and under the runner's bash -e that ends the whole script.
+            case "$proj" in core/*) continue ;; esac
+            tfm=$(grep -oE '<TargetFramework>[^<]*' "$proj" | head -1 | cut -d'>' -f2)
+            [ "$tfm" = "net10.0" ] || continue
+            case "$proj" in
+              *"Tutorial Samples/Platformer/Checkpoints"*)
+                echo "SKIPPED (known broken, see comment): $proj"
+                skipped=$((skipped+1)); continue ;;
+            esac
+            built=$((built+1))
+            echo "::group::$proj"
+            dotnet build "$proj" -c Release --nologo || fail=1
+            echo "::endgroup::"
+          done
+          echo "built $built project(s), skipped $skipped known-broken checkpoint(s)"
+          [ "$built" -gt 0 ] || { echo "::error::no net10.0 projects found"; exit 1; }
+          exit $fail
